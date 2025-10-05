@@ -33,14 +33,14 @@
   @keyframes fadeIn{from{opacity:0;transform:translateY(30px)}to{opacity:1;transform:translateY(0)}}
   .dark canvas{background:#141414}
 </style>
-<!-- TensorFlow.js + BodyPix (for person segmentation) -->
+<!-- TensorFlow.js + BodyPix -->
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.21.0/dist/tf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/body-pix@2.2.0/dist/body-pix.min.js"></script>
 </head>
 <body>
   <div class="container">
     <h1>Image Background Remover</h1>
-    <p class="sub">Upload an image → Auto Remove (Person) → refine with brush → Download PNG (transparent).</p>
+    <p class="sub">Upload → ✨ Auto Remove (Person) → refine with brush → Download PNG.</p>
 
     <div class="toolbar">
       <input id="file" type="file" accept="image/*"/>
@@ -69,7 +69,7 @@
       <span class="chip">TF.js BodyPix</span>
       <span class="chip">Brush refine</span>
       <span class="chip">Undo</span>
-      <span class="chip">Feathered edges</span>
+      <span class="chip">Feather edges</span>
     </div>
 
     <div id="status" class="status">Idle</div>
@@ -119,16 +119,31 @@
   const outCtx = outCanvas.getContext("2d");
 
   let img = new Image();
-  let maskCanvas = document.createElement("canvas"); // alpha mask (white = keep, black = remove)
+  let maskCanvas = document.createElement("canvas"); // mask (RED channel = keep 255 / remove 0)
   let maskCtx = maskCanvas.getContext("2d");
-  let history = []; // for undo stack (stores ImageData of mask)
-
+  let history = []; // undo stack (ImageData of mask)
   let bodypixModel = null;
 
   function setStatus(s){ statusEl.textContent = s; }
   function warn(s){ if(!s){warnEl.style.display="none";warnEl.textContent=""} else {warnEl.style.display="block";warnEl.textContent=s} }
 
-  // Load image from file input
+  // Init TF backend safely
+  (async () => {
+    try {
+      await tf.ready();
+      // Prefer WebGL, fall back to CPU if needed
+      const backends = ["webgl","cpu"];
+      for (const b of backends) {
+        try { await tf.setBackend(b); await tf.ready(); setStatus(`TF.js backend: ${tf.getBackend()}`); break; }
+        catch (_){ /* ignore */ }
+      }
+    } catch (e) {
+      console.warn("TF init failed", e);
+      warn("If auto-remove fails on this device, use the brush refine.");
+    }
+  })();
+
+  // Load image
   fileEl.addEventListener("change", () => {
     const f = fileEl.files?.[0];
     if (!f) return;
@@ -140,24 +155,28 @@
       srcCtx.clearRect(0,0,srcCanvas.width,srcCanvas.height);
       srcCtx.drawImage(img, 0, 0, srcCanvas.width, srcCanvas.height);
 
-      // reset mask (start with all transparent — i.e., keep full image)
+      // init mask: white (keep all) in RED channel
       maskCanvas.width = srcCanvas.width;
       maskCanvas.height = srcCanvas.height;
       maskCtx.clearRect(0,0,maskCanvas.width,maskCanvas.height);
-      // initialize mask as "keep everything" (white)
-      maskCtx.fillStyle = "#fff";
-      maskCtx.fillRect(0,0,maskCanvas.width,maskCanvas.height);
+      const m = maskCtx.createImageData(maskCanvas.width, maskCanvas.height);
+      for (let i=0;i<m.data.length;i+=4){
+        m.data[i] = 255;   // RED = 255 keep
+        m.data[i+1] = 255; // not used, for preview only
+        m.data[i+2] = 255; // not used
+        m.data[i+3] = 255; // opaque
+      }
+      maskCtx.putImageData(m,0,0);
       pushHistory();
 
-      composeOutput(); // draw initial
+      composeOutput();
       setStatus("Image loaded");
     };
     img.src = url;
   });
 
-  // Fit both canvases to a reasonable size
   function fitToCanvas(w, h){
-    const MAX = 1000; // limit for performance
+    const MAX = 1000;
     let W = w, H = h;
     const scale = Math.min(MAX / W, MAX / H, 1);
     W = Math.round(W * scale); H = Math.round(H * scale);
@@ -165,83 +184,73 @@
     outCanvas.width = W; outCanvas.height = H;
   }
 
-  // Compose output: src * mask => transparent background PNG
+  // Compose: src * (mask.red / 255) → transparent BG
   function composeOutput(){
     if (!img || !srcCanvas.width) return;
     outCtx.clearRect(0,0,outCanvas.width,outCanvas.height);
 
-    // Create an ImageData from source
     const srcData = srcCtx.getImageData(0,0,srcCanvas.width,srcCanvas.height);
     const mData = maskCtx.getImageData(0,0,maskCanvas.width,maskCanvas.height);
-    const d = srcData.data, md = mData.data;
 
-    // Feather mask by simple box blur radius from slider
+    // Feather RED channel (mask) in-place
     const radius = parseInt(featherEl.value, 10);
-    if (radius > 0) blurAlpha(md, maskCanvas.width, maskCanvas.height, radius);
+    if (radius > 0) blurRed(mData.data, maskCanvas.width, maskCanvas.height, radius);
 
-    // Apply mask alpha
+    const d = srcData.data, md = mData.data;
     for (let i=0;i<d.length;i+=4){
-      // mask is greyscale; use red channel
-      const a = md[i]; // 0..255
-      d[i+3] = Math.round(d[i+3] * (a/255)); // new alpha
+      const red = md[i]; // 0..255 (keep strength)
+      d[i+3] = Math.round(d[i+3] * (red/255)); // apply as alpha multiplier
     }
-
     outCtx.putImageData(srcData, 0, 0);
   }
 
-  // Simple stack blur on alpha channel only (fast box blur)
-  function blurAlpha(data, w, h, r){
-    // Horizontal pass
-    const tmp = new Uint8ClampedArray(data.length);
-    for (let y=0; y<h; y++){
-      let acc=0, count=0;
-      for (let x=0; x<w; x++){
+  // Box blur on RED channel only (fast, two-pass)
+  function blurRed(data, w, h, r){
+    const tmp = new Uint8ClampedArray(w*h); // store blurred red
+    // horizontal
+    for (let y=0;y<h;y++){
+      let acc=0, cnt=0;
+      for (let x=0;x<w;x++){
         const idx=(y*w+x)*4;
-        const a=data[idx]; acc+=a; count++;
+        acc += data[idx]; cnt++;
         const left=x-r-1, right=x+r;
-        if (left>=0){ const li=(y*w+left)*4; acc-=data[li]; count--; }
-        if (x>=r){ // write smoothed
+        if (left>=0){ const li=(y*w+left)*4; acc -= data[li]; cnt--; }
+        if (x>=r){
           const wx=x-r;
-          const wi=(y*w+wx)*4;
-          tmp[wi]=tmp[wi+1]=tmp[wi+2]=255; // not used for rgb
-          tmp[wi+3]=Math.round(acc/count);
+          const wi=(y*w+wx);
+          tmp[wi] = Math.round(acc/cnt);
         }
       }
-      // flush tail
       for (let x=w-r; x<w; x++){
-        const wi=(y*w+x)*4;
-        tmp[wi+3]=Math.round(acc/count);
+        const wi=(y*w+x);
+        tmp[wi] = Math.round(acc/cnt);
       }
     }
-    // Vertical pass
-    const out = new Uint8ClampedArray(data.length);
-    for (let x=0; x<w; x++){
-      let acc=0, count=0;
-      for (let y=0; y<h; y++){
-        const idx=(y*w+x)*4;
-        const a=tmp[idx+3]; acc+=a; count++;
+    // vertical
+    for (let x=0;x<w;x++){
+      let acc=0, cnt=0;
+      for (let y=0;y<h;y++){
+        const idx=(y*w+x);
+        acc += tmp[idx]; cnt++;
         const up=y-r-1, down=y+r;
-        if (up>=0){ const ui=(up*w+x)*4; acc-=tmp[ui+3]; count--; }
+        if (up>=0){ const ui=(up*w+x); acc -= tmp[ui]; cnt--; }
         if (y>=r){
           const wy=y-r;
           const wi=(wy*w+x)*4;
-          out[wi]=out[wi+1]=out[wi+2]=255;
-          out[wi+3]=Math.round(acc/count);
+          const val = Math.round(acc/cnt);
+          data[wi] = data[wi+1] = data[wi+2] = val; // keep grey preview
+          // alpha stays 255
         }
       }
       for (let y=h-r; y<h; y++){
         const wi=(y*w+x)*4;
-        out[wi+3]=Math.round(acc/count);
+        const val = Math.round(acc/cnt);
+        data[wi] = data[wi+1] = data[wi+2] = val;
       }
-    }
-    // copy back alpha to original data buffer
-    for (let i=0;i<data.length;i+=4){
-      data[i]=data[i+1]=data[i+2]=255; // keep mask greyscale
-      data[i+3]=out[i+3];
     }
   }
 
-  // Brush painting: erase = paint black on mask (remove), restore = white (keep)
+  // Brush paint: change RED channel (erase=0, restore=255)
   let painting=false, last=null;
   srcCanvas.addEventListener("pointerdown",(e)=>{ if (!srcCanvas.width) return; painting=true; last=getPos(e); pushHistory(); paint(last, last); });
   srcCanvas.addEventListener("pointermove",(e)=>{ if (!painting) return; const p=getPos(e); paint(last,p); last=p; });
@@ -257,7 +266,7 @@
     maskCtx.lineCap="round";
     maskCtx.lineJoin="round";
     maskCtx.lineWidth=size;
-    maskCtx.strokeStyle = modeEl.value === "erase" ? "#000" : "#fff";
+    maskCtx.strokeStyle = modeEl.value === "erase" ? "rgb(0,0,0)" : "rgb(255,255,255)";
     maskCtx.beginPath();
     maskCtx.moveTo(a.x,a.y);
     maskCtx.lineTo(b.x,b.y);
@@ -266,7 +275,6 @@
   }
 
   function pushHistory(){
-    // keep up to 20 steps
     const snap = maskCtx.getImageData(0,0,maskCanvas.width,maskCanvas.height);
     history.push(snap);
     if (history.length>20) history.shift();
@@ -284,8 +292,12 @@
   clearMaskBtn.addEventListener("click", ()=>{
     if (!maskCanvas.width) return;
     pushHistory();
-    maskCtx.fillStyle="#fff"; // keep all
-    maskCtx.fillRect(0,0,maskCanvas.width,maskCanvas.height);
+    const m = maskCtx.createImageData(maskCanvas.width, maskCanvas.height);
+    for (let i=0;i<m.data.length;i+=4){
+      m.data[i]=m.data[i+1]=m.data[i+2]=255; // keep all
+      m.data[i+3]=255;
+    }
+    maskCtx.putImageData(m,0,0);
     composeOutput();
     setStatus("Mask cleared");
   });
@@ -294,20 +306,22 @@
   autoBtn.addEventListener("click", async ()=>{
     if (!srcCanvas.width){ setStatus("Upload an image first."); return; }
     try{
-      setStatus("Loading model… (first time may take a few seconds)");
+      setStatus("Loading model…");
       await loadBodyPix();
       setStatus("Segmenting person…");
       const seg = await bodypixModel.segmentPerson(srcCanvas, {
         internalResolution: "medium",
         segmentationThreshold: 0.7,
       });
-      // seg.data: Uint8Array (1=person,0=bg)
+      // Build mask where RED=255 for person (keep), 0 for background
       const m = maskCtx.createImageData(maskCanvas.width, maskCanvas.height);
       for (let i=0;i<seg.data.length;i++){
-        const v = seg.data[i] ? 255 : 0; // person=white (keep), background=black
+        const v = seg.data[i] ? 255 : 0;
         const j = i*4;
-        m.data[j]=m.data[j+1]=m.data[j+2]=255; // greyscale visual (not used)
-        m.data[j+3]=v;
+        m.data[j]   = v; // RED carries mask
+        m.data[j+1] = v;
+        m.data[j+2] = v;
+        m.data[j+3] = 255; // opaque
       }
       maskCtx.putImageData(m,0,0);
       pushHistory();
@@ -315,7 +329,8 @@
       setStatus("Auto remove done. Use brush to refine if needed.");
     }catch(err){
       console.error(err);
-      setStatus("Auto remove failed"); warn("If model fails on mobile/low RAM, try a smaller image.");
+      setStatus("Auto remove failed");
+      warn("If model fails on this device, try a smaller image or use brush refine.");
     }
   });
 
@@ -330,7 +345,7 @@
     return bodypixModel;
   }
 
-  // Download PNG (transparent)
+  // Download PNG
   downloadBtn.addEventListener("click", ()=>{
     if (!outCanvas.width) return;
     const link = document.createElement("a");
@@ -341,7 +356,7 @@
   });
 
   // Initial hint
-  warn("Upload an image (prefer a single-person photo) then click ✨ Auto Remove, or use the brush.");
+  warn("Upload an image (best: single-person photo) then click ✨ Auto Remove, or paint the mask.");
 </script>
 </body>
 </html>
