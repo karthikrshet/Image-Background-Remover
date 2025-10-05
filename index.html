@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Image Background Remover</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;font-family:"Montserrat",system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+  body{background:linear-gradient(135deg,#74ABE2,#5563DE);min-height:100vh;display:flex;flex-direction:column;justify-content:center;align-items:center;transition:background .4s ease;padding:24px}
+  .container{background:rgba(255,255,255,.15);backdrop-filter:blur(15px);padding:26px;border-radius:16px;text-align:center;width:min(1200px,100%);box-shadow:0 8px 32px rgba(0,0,0,.2);animation:fadeIn .8s ease}
+  h1{color:#fff;font-size:34px;margin-bottom:8px}
+  p.sub{color:#eef;opacity:.9;margin-bottom:14px;font-size:14px}
+  .toolbar{display:flex;flex-wrap:wrap;gap:10px;justify-content:center;align-items:center;margin:10px 0 14px}
+  .toolbar > *{border:none;border-radius:10px}
+  input[type="file"]{background:rgba(255,255,255,.25);color:#fff;padding:10px 12px}
+  select,button,input[type="range"]{padding:10px 12px;font-size:14px}
+  button{color:#fff;background:#ff7b54;cursor:pointer;transition:transform .2s,background .3s}
+  button:hover{background:#ff5722;transform:translateY(-1px)}
+  button.secondary{background:rgba(255,255,255,.25)}
+  button.secondary:hover{background:rgba(255,255,255,.35)}
+  .chips{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:4px}
+  .chip{background:rgba(255,255,255,.2);color:#fff;border-radius:999px;padding:6px 10px;font-size:12px;border:1px solid rgba(255,255,255,.25)}
+  .status{margin:8px 0 6px;font-weight:700;color:#fff}
+  .warn{color:#ffe08a;font-size:13px;margin:6px 0}
+  .stage{display:grid;grid-template-columns:1fr;gap:12px;margin-top:12px}
+  @media (min-width:1000px){ .stage{grid-template-columns:1fr 1fr} }
+  .panel{background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.25);border-radius:12px;padding:12px}
+  .panel h3{color:#fff;margin-bottom:8px;font-size:16px}
+  canvas{width:100%;height:auto;background:#fff;border-radius:8px}
+  .theme-toggle{margin-top:12px;color:#fff;cursor:pointer;font-size:13px;text-decoration:underline}
+  footer{margin-top:16px;color:#fff;font-size:14px;text-align:center}
+  footer strong{color:#ffdd57;cursor:pointer}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(30px)}to{opacity:1;transform:translateY(0)}}
+  .dark canvas{background:#141414}
+</style>
+<!-- TensorFlow.js + BodyPix (for person segmentation) -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.21.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/body-pix@2.2.0/dist/body-pix.min.js"></script>
+</head>
+<body>
+  <div class="container">
+    <h1>Image Background Remover</h1>
+    <p class="sub">Upload an image → Auto Remove (Person) → refine with brush → Download PNG (transparent).</p>
+
+    <div class="toolbar">
+      <input id="file" type="file" accept="image/*"/>
+      <button id="autoBtn" class="secondary">✨ Auto Remove (Person)</button>
+
+      <select id="mode">
+        <option value="erase">Erase (remove background)</option>
+        <option value="restore">Restore (bring back subject)</option>
+      </select>
+
+      <label style="color:#fff">Brush
+        <input id="brush" type="range" min="5" max="120" value="40" />
+      </label>
+
+      <label style="color:#fff">Feather
+        <input id="feather" type="range" min="0" max="18" value="6" />
+      </label>
+
+      <button id="undoBtn" class="secondary">↶ Undo</button>
+      <button id="clearMaskBtn" class="secondary">🧹 Clear Mask</button>
+      <button id="downloadBtn">⬇ Download PNG</button>
+    </div>
+
+    <div class="chips">
+      <span class="chip">Client-side</span>
+      <span class="chip">TF.js BodyPix</span>
+      <span class="chip">Brush refine</span>
+      <span class="chip">Undo</span>
+      <span class="chip">Feathered edges</span>
+    </div>
+
+    <div id="status" class="status">Idle</div>
+    <div id="warn" class="warn" style="display:none;"></div>
+
+    <div class="stage">
+      <div class="panel">
+        <h3>Original</h3>
+        <canvas id="srcCanvas"></canvas>
+      </div>
+      <div class="panel">
+        <h3>Cutout (transparent)</h3>
+        <canvas id="outCanvas"></canvas>
+      </div>
+    </div>
+
+    <div class="theme-toggle" id="toggleTheme">Switch Theme</div>
+  </div>
+
+  <footer>Developed by <strong>Karthik Shet</strong></footer>
+
+<script>
+  // ===== Theme =====
+  const themeToggle = document.getElementById("toggleTheme");
+  let dark = false;
+  themeToggle.addEventListener("click", () => {
+    dark = !dark;
+    document.body.classList.toggle("dark", dark);
+    document.body.style.background = dark ? "linear-gradient(135deg,#1f1f1f,#3a3a3a)" : "linear-gradient(135deg,#74ABE2,#5563DE)";
+  });
+
+  // ===== Elements =====
+  const fileEl = document.getElementById("file");
+  const autoBtn = document.getElementById("autoBtn");
+  const modeEl = document.getElementById("mode");
+  const brushEl = document.getElementById("brush");
+  const featherEl = document.getElementById("feather");
+  const undoBtn = document.getElementById("undoBtn");
+  const clearMaskBtn = document.getElementById("clearMaskBtn");
+  const downloadBtn = document.getElementById("downloadBtn");
+  const statusEl = document.getElementById("status");
+  const warnEl = document.getElementById("warn");
+
+  const srcCanvas = document.getElementById("srcCanvas");
+  const outCanvas = document.getElementById("outCanvas");
+  const srcCtx = srcCanvas.getContext("2d");
+  const outCtx = outCanvas.getContext("2d");
+
+  let img = new Image();
+  let maskCanvas = document.createElement("canvas"); // alpha mask (white = keep, black = remove)
+  let maskCtx = maskCanvas.getContext("2d");
+  let history = []; // for undo stack (stores ImageData of mask)
+
+  let bodypixModel = null;
+
+  function setStatus(s){ statusEl.textContent = s; }
+  function warn(s){ if(!s){warnEl.style.display="none";warnEl.textContent=""} else {warnEl.style.display="block";warnEl.textContent=s} }
+
+  // Load image from file input
+  fileEl.addEventListener("change", () => {
+    const f = fileEl.files?.[0];
+    if (!f) return;
+    const url = URL.createObjectURL(f);
+    img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      fitToCanvas(img.width, img.height);
+      srcCtx.clearRect(0,0,srcCanvas.width,srcCanvas.height);
+      srcCtx.drawImage(img, 0, 0, srcCanvas.width, srcCanvas.height);
+
+      // reset mask (start with all transparent — i.e., keep full image)
+      maskCanvas.width = srcCanvas.width;
+      maskCanvas.height = srcCanvas.height;
+      maskCtx.clearRect(0,0,maskCanvas.width,maskCanvas.height);
+      // initialize mask as "keep everything" (white)
+      maskCtx.fillStyle = "#fff";
+      maskCtx.fillRect(0,0,maskCanvas.width,maskCanvas.height);
+      pushHistory();
+
+      composeOutput(); // draw initial
+      setStatus("Image loaded");
+    };
+    img.src = url;
+  });
+
+  // Fit both canvases to a reasonable size
+  function fitToCanvas(w, h){
+    const MAX = 1000; // limit for performance
+    let W = w, H = h;
+    const scale = Math.min(MAX / W, MAX / H, 1);
+    W = Math.round(W * scale); H = Math.round(H * scale);
+    srcCanvas.width = W; srcCanvas.height = H;
+    outCanvas.width = W; outCanvas.height = H;
+  }
+
+  // Compose output: src * mask => transparent background PNG
+  function composeOutput(){
+    if (!img || !srcCanvas.width) return;
+    outCtx.clearRect(0,0,outCanvas.width,outCanvas.height);
+
+    // Create an ImageData from source
+    const srcData = srcCtx.getImageData(0,0,srcCanvas.width,srcCanvas.height);
+    const mData = maskCtx.getImageData(0,0,maskCanvas.width,maskCanvas.height);
+    const d = srcData.data, md = mData.data;
+
+    // Feather mask by simple box blur radius from slider
+    const radius = parseInt(featherEl.value, 10);
+    if (radius > 0) blurAlpha(md, maskCanvas.width, maskCanvas.height, radius);
+
+    // Apply mask alpha
+    for (let i=0;i<d.length;i+=4){
+      // mask is greyscale; use red channel
+      const a = md[i]; // 0..255
+      d[i+3] = Math.round(d[i+3] * (a/255)); // new alpha
+    }
+
+    outCtx.putImageData(srcData, 0, 0);
+  }
+
+  // Simple stack blur on alpha channel only (fast box blur)
+  function blurAlpha(data, w, h, r){
+    // Horizontal pass
+    const tmp = new Uint8ClampedArray(data.length);
+    for (let y=0; y<h; y++){
+      let acc=0, count=0;
+      for (let x=0; x<w; x++){
+        const idx=(y*w+x)*4;
+        const a=data[idx]; acc+=a; count++;
+        const left=x-r-1, right=x+r;
+        if (left>=0){ const li=(y*w+left)*4; acc-=data[li]; count--; }
+        if (x>=r){ // write smoothed
+          const wx=x-r;
+          const wi=(y*w+wx)*4;
+          tmp[wi]=tmp[wi+1]=tmp[wi+2]=255; // not used for rgb
+          tmp[wi+3]=Math.round(acc/count);
+        }
+      }
+      // flush tail
+      for (let x=w-r; x<w; x++){
+        const wi=(y*w+x)*4;
+        tmp[wi+3]=Math.round(acc/count);
+      }
+    }
+    // Vertical pass
+    const out = new Uint8ClampedArray(data.length);
+    for (let x=0; x<w; x++){
+      let acc=0, count=0;
+      for (let y=0; y<h; y++){
+        const idx=(y*w+x)*4;
+        const a=tmp[idx+3]; acc+=a; count++;
+        const up=y-r-1, down=y+r;
+        if (up>=0){ const ui=(up*w+x)*4; acc-=tmp[ui+3]; count--; }
+        if (y>=r){
+          const wy=y-r;
+          const wi=(wy*w+x)*4;
+          out[wi]=out[wi+1]=out[wi+2]=255;
+          out[wi+3]=Math.round(acc/count);
+        }
+      }
+      for (let y=h-r; y<h; y++){
+        const wi=(y*w+x)*4;
+        out[wi+3]=Math.round(acc/count);
+      }
+    }
+    // copy back alpha to original data buffer
+    for (let i=0;i<data.length;i+=4){
+      data[i]=data[i+1]=data[i+2]=255; // keep mask greyscale
+      data[i+3]=out[i+3];
+    }
+  }
+
+  // Brush painting: erase = paint black on mask (remove), restore = white (keep)
+  let painting=false, last=null;
+  srcCanvas.addEventListener("pointerdown",(e)=>{ if (!srcCanvas.width) return; painting=true; last=getPos(e); pushHistory(); paint(last, last); });
+  srcCanvas.addEventListener("pointermove",(e)=>{ if (!painting) return; const p=getPos(e); paint(last,p); last=p; });
+  window.addEventListener("pointerup",()=>{ painting=false; last=null; });
+
+  function getPos(e){
+    const rect = srcCanvas.getBoundingClientRect();
+    return { x: Math.round((e.clientX - rect.left) * (srcCanvas.width / rect.width)),
+             y: Math.round((e.clientY - rect.top)  * (srcCanvas.height / rect.height)) };
+  }
+  function paint(a,b){
+    const size = parseInt(brushEl.value, 10);
+    maskCtx.lineCap="round";
+    maskCtx.lineJoin="round";
+    maskCtx.lineWidth=size;
+    maskCtx.strokeStyle = modeEl.value === "erase" ? "#000" : "#fff";
+    maskCtx.beginPath();
+    maskCtx.moveTo(a.x,a.y);
+    maskCtx.lineTo(b.x,b.y);
+    maskCtx.stroke();
+    composeOutput();
+  }
+
+  function pushHistory(){
+    // keep up to 20 steps
+    const snap = maskCtx.getImageData(0,0,maskCanvas.width,maskCanvas.height);
+    history.push(snap);
+    if (history.length>20) history.shift();
+  }
+  undoBtn.addEventListener("click", ()=>{
+    if (history.length>1){
+      history.pop();
+      const prev = history[history.length-1];
+      maskCtx.putImageData(prev,0,0);
+      composeOutput();
+      setStatus("Undo");
+    }
+  });
+
+  clearMaskBtn.addEventListener("click", ()=>{
+    if (!maskCanvas.width) return;
+    pushHistory();
+    maskCtx.fillStyle="#fff"; // keep all
+    maskCtx.fillRect(0,0,maskCanvas.width,maskCanvas.height);
+    composeOutput();
+    setStatus("Mask cleared");
+  });
+
+  // Auto remove using BodyPix (person segmentation)
+  autoBtn.addEventListener("click", async ()=>{
+    if (!srcCanvas.width){ setStatus("Upload an image first."); return; }
+    try{
+      setStatus("Loading model… (first time may take a few seconds)");
+      await loadBodyPix();
+      setStatus("Segmenting person…");
+      const seg = await bodypixModel.segmentPerson(srcCanvas, {
+        internalResolution: "medium",
+        segmentationThreshold: 0.7,
+      });
+      // seg.data: Uint8Array (1=person,0=bg)
+      const m = maskCtx.createImageData(maskCanvas.width, maskCanvas.height);
+      for (let i=0;i<seg.data.length;i++){
+        const v = seg.data[i] ? 255 : 0; // person=white (keep), background=black
+        const j = i*4;
+        m.data[j]=m.data[j+1]=m.data[j+2]=255; // greyscale visual (not used)
+        m.data[j+3]=v;
+      }
+      maskCtx.putImageData(m,0,0);
+      pushHistory();
+      composeOutput();
+      setStatus("Auto remove done. Use brush to refine if needed.");
+    }catch(err){
+      console.error(err);
+      setStatus("Auto remove failed"); warn("If model fails on mobile/low RAM, try a smaller image.");
+    }
+  });
+
+  async function loadBodyPix(){
+    if (bodypixModel) return bodypixModel;
+    bodypixModel = await bodyPix.load({
+      architecture:"MobileNetV1",
+      outputStride:16,
+      multiplier:0.75,
+      quantBytes:2
+    });
+    return bodypixModel;
+  }
+
+  // Download PNG (transparent)
+  downloadBtn.addEventListener("click", ()=>{
+    if (!outCanvas.width) return;
+    const link = document.createElement("a");
+    link.href = outCanvas.toDataURL("image/png");
+    link.download = `cutout_${Date.now()}.png`;
+    document.body.appendChild(link); link.click(); link.remove();
+    setStatus("PNG downloaded");
+  });
+
+  // Initial hint
+  warn("Upload an image (prefer a single-person photo) then click ✨ Auto Remove, or use the brush.");
+</script>
+</body>
+</html>
